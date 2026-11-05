@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+work/
+outputs/
+catboost_info/
+.streamlit/secrets.toml
+.env
+
