@@ -1,0 +1,11 @@
+.git/
+__pycache__/
+*.py[cod]
+work/
+outputs/
+catboost_info/
+.venv/
+venv/
+.streamlit/secrets.toml
+.env
+
