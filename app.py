@@ -34,6 +34,9 @@ def style():
     .hero{color:#f6fbff;text-align:center;font-size:clamp(1.8rem,5vw,3.5rem);font-weight:800;margin:1rem}.sub{color:#c2d6e9;text-align:center;margin-bottom:1.4rem}
     [data-testid="stMetric"], [data-testid="stForm"]{background:linear-gradient(145deg,rgba(28,48,75,.97),rgba(8,20,38,.97));border:1px solid rgba(93,173,204,.3);border-radius:18px;padding:1rem;box-shadow:0 12px 28px rgba(0,0,0,.35),inset 0 1px rgba(255,255,255,.09)}
     [data-testid="stDataFrame"]{border:1px solid rgba(93,173,204,.25);border-radius:14px;overflow:hidden;box-shadow:0 12px 28px rgba(0,0,0,.25)}
+    .forecast-loading{display:flex;align-items:center;justify-content:center;gap:.65rem;min-height:44px;padding:.55rem 1rem;border-radius:.5rem;background:#205d70;color:white;font-weight:600}
+    .forecast-loading:before{content:"";width:17px;height:17px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:forecast-spin .75s linear infinite}
+    @keyframes forecast-spin{to{transform:rotate(360deg)}}
     @media(max-width:640px){.block-container{padding:1rem .8rem 3rem}[data-testid="stMetric"]{padding:.8rem}.stButton button{width:100%;min-height:44px} [data-testid="stTabs"] button{font-size:.85rem}}
     </style>""", unsafe_allow_html=True)
 
@@ -179,10 +182,15 @@ def user_screen(account):
     except Exception as e:st.error(f"Could not load NSE directory: {e}");return
     labels=dict(zip(stock.ticker,stock.label)); one,two=st.columns([2,1])
     with one: chosen=st.multiselect("Select up to 10 NSE stocks",list(labels),format_func=lambda x:labels[x],max_selections=10,placeholder="Search by company or symbol")
-    with two: choice=st.selectbox("Forecast interval",list(INTERVALS));go=st.button("Forecast selected stocks",type="primary",use_container_width=True,disabled=not chosen)
+    with two:
+        choice=st.selectbox("Forecast interval",list(INTERVALS))
+        button_area=st.empty()
+        go=button_area.button("Forecast selected stocks",type="primary",use_container_width=True,disabled=not chosen)
     if not go:return
-    interval,period=INTERVALS[choice]; output=[]; checks=[]; bar=st.progress(0)
+    button_area.markdown('<div class="forecast-loading" role="status" aria-live="polite">Forecasting… please wait</div>',unsafe_allow_html=True)
+    interval,period=INTERVALS[choice]; output=[]; checks=[]; bar=st.progress(0,text="Preparing forecast data…")
     for i,t in enumerate(chosen,1):
+        bar.progress((i-1)/len(chosen),text=f"Forecasting {labels[t]} ({i} of {len(chosen)})…")
         try:
             log_activity(account,"forecast",labels[t],choice)
             p,h,v,_,_=forecast(t,interval,period);last=h.iloc[-1]
@@ -190,7 +198,10 @@ def user_screen(account):
             v.insert(0,"Stock",labels[t]);checks.append(v)
         except Exception as e:output.append({"Stock":labels[t],"Status":"Unavailable: "+str(e)})
         bar.progress(i/len(chosen),text=f"Forecasting {i} of {len(chosen)}")
-    bar.empty();st.subheader("Forecast results")
+    bar.empty()
+    if button_area.button("Start a new forecast",type="primary",use_container_width=True,key="forecast_again"):
+        st.rerun()
+    st.subheader("Forecast results")
     result_df=pd.DataFrame(output); numeric=[x for x in result_df.columns if x not in {"Stock","Status"}]
     st.dataframe(result_df.style.format({x:"{:.2f}" for x in numeric}),use_container_width=True,hide_index=True)
     if checks:
