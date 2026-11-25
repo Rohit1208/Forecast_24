@@ -167,9 +167,13 @@ def user_screen(account):
             v.insert(0,"Stock",labels[t]);checks.append(v)
         except Exception as e:output.append({"Stock":labels[t],"Status":"Unavailable: "+str(e)})
         bar.progress(i/len(chosen),text=f"Forecasting {i} of {len(chosen)}")
-    bar.empty();st.subheader("Forecast results");st.dataframe(pd.DataFrame(output).style.format({x:"{:.2f}" for x in ["Forecast Open","Forecast High","Forecast Low","Forecast Close","Expected Close Change %","Last 5 Days Deviation %"]}),use_container_width=True,hide_index=True)
+    bar.empty();st.subheader("Forecast results")
+    result_df=pd.DataFrame(output); numeric=[x for x in result_df.columns if x not in {"Stock","Status"}]
+    st.dataframe(result_df.style.format({x:"{:.2f}" for x in numeric}),use_container_width=True,hide_index=True)
     if checks:
-        st.subheader("Last five days validation");st.dataframe(pd.concat(checks,ignore_index=True).style.format({x:"{:.2f}" for x in TARGETS+["Close deviation %"] if x in TARGETS+["Close deviation %"]}),use_container_width=True,hide_index=True)
+        st.subheader("Last five days validation")
+        check_df=pd.concat(checks,ignore_index=True)
+        st.dataframe(check_df.style.format({x:"{:.2f}" for x in check_df.columns if x not in {"Stock","Date"}}),use_container_width=True,hide_index=True)
 
 def admin_screen():
     forecast_tab,accounts_tab=st.tabs(["Forecast workspace","Account approvals"])
