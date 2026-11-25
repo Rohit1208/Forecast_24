@@ -4,7 +4,7 @@ __pycache__/
 venv/
 work/
 outputs/
+data/
 catboost_info/
 .streamlit/secrets.toml
 .env
-
