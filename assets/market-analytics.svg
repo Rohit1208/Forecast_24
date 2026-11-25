@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900">
+  <rect width="1600" height="900" fill="#061120"/>
+  <g stroke="#17415a" opacity=".5"><path d="M0 180H1600M0 360H1600M0 540H1600M0 720H1600M200 0V900M400 0V900M600 0V900M800 0V900M1000 0V900M1200 0V900M1400 0V900"/></g>
+  <g fill="none" stroke="#19c6ab" stroke-width="5" opacity=".6"><path d="M0 720L160 650 260 690 370 540 490 590 620 420 750 480 900 300 1020 380 1180 220 1320 290 1600 110"/><circle cx="370" cy="540" r="9"/><circle cx="900" cy="300" r="9"/><circle cx="1180" cy="220" r="9"/></g>
+  <g stroke="#3dd4be" fill="#3dd4be" opacity=".28"><path d="M260 380v140M390 320v190M520 390v150M650 230v190M780 280v150M910 170v170M1040 220v160M1170 130v160M1300 170v150" stroke-width="4"/><path d="M250 410h20v75h-20zM380 355h20v100h-20zM510 420h20v80h-20zM640 270h20v105h-20zM770 310h20v75h-20zM900 205h20v90h-20zM1030 250h20v80h-20zM1160 160h20v85h-20zM1290 200h20v75h-20z"/></g>
+  <g fill="#77a9c7" opacity=".3" font-family="sans-serif" font-size="24" letter-spacing="5"><text x="80" y="100">PROJECT 24  /  MARKET INTELLIGENCE</text><text x="1120" y="790">OHLC  •  AI  •  ANALYTICS</text></g>
+</svg>
+

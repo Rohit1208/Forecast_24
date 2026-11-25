@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 work/
 outputs/
+data/
 catboost_info/
 .venv/
 venv/

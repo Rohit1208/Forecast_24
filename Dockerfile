@@ -6,6 +6,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py README.md ./
+COPY assets/ ./assets/
+COPY .streamlit/config.toml ./.streamlit/config.toml
 
 EXPOSE 8501
 

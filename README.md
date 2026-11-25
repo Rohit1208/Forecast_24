@@ -20,10 +20,11 @@ The database is stored at \`data/marketforecast.db\` by default. For deployment,
 
 ## Forecasting behavior
 
-Users can select up to ten NSE stocks and one interval. The app evaluates XGBoost, CatBoost, AdaBoost, and Gradient Boosting using the latest five walk-forward validations, automatically uses the lowest recent close-deviation model, and shows only the forecast results and validation data. Algorithm controls and charts are restricted to the administrator workspace.
+Users can select up to ten NSE stocks and one interval. The app evaluates XGBoost, Gradient Boosting, Histogram Gradient Boosting, and Ridge Regression using the latest five walk-forward validations, automatically uses the lowest recent close-deviation model, and shows only the forecast results and validation data. Algorithm controls and charts are restricted to the administrator workspace. Recent identical forecasts are cached for five minutes to speed up repeat requests.
 
 Yahoo Finance may delay or revise market data. Forecasts are estimates for informational use only and are not investment advice.
 
 ## AWS deployment
 
 The included \`Dockerfile\` runs the service on port \`8501\`. On EC2, allow port 8501 only while testing; for a public production site, place it behind HTTPS via a reverse proxy/load balancer and use a persistent database. Do not commit passwords, AWS keys, or email credentials to this repository.
+
