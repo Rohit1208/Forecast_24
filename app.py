@@ -1,344 +1,213 @@
-"""Interactive next-bar OHLC forecasts using Yahoo Finance and XGBoost."""
+"""Role-based NSE OHLC forecast web application."""
 from __future__ import annotations
-
-from datetime import timedelta
+import hashlib, hmac, os, secrets, sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from sklearn.ensemble import AdaBoostRegressor, ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import AdaBoostRegressor, GradientBoostingRegressor
 from xgboost import XGBRegressor
 
+st.set_page_config(page_title="MarketForecast", page_icon="📈", layout="wide")
+FEATURES = ["Open","High","Low","Close","Close_lag1","Close_lag2","Close_lag3","Open_lag1","High_lag1","Low_lag1","Volume","MA5","MA10"]
+TARGETS = ["Open","High","Low","Close"]
+ALGORITHMS = ["XGBoost","CatBoost","AdaBoost","Gradient Boosting"]
+INTERVALS = {"1 day (next trading day)":("1d","5y"),"1 hour (next hour)":("1h","730d"),"30 minutes (next bar)":("30m","60d"),"15 minutes (next bar)":("15m","60d"),"5 minutes (next bar)":("5m","60d")}
+DB_PATH = Path(os.getenv("APP_DB_PATH", Path(__file__).parent / "data" / "marketforecast.db"))
+NSE_LIST = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 
-st.set_page_config(page_title="OHLC Forecast", page_icon="📈", layout="wide")
+def style():
+    st.markdown("""<style>
+    .stApp{background:linear-gradient(rgba(3,14,29,.88),rgba(3,14,29,.88)),url("https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?auto=format&fit=crop&w=2400&q=80");background-size:cover;background-attachment:fixed}
+    [data-testid="stHeader"]{background:transparent}.block-container{max-width:1180px;padding-top:2rem}
+    .hero{color:#f6fbff;text-align:center;font-size:2.7rem;font-weight:800;margin:1rem}.sub{color:#c2d6e9;text-align:center;margin-bottom:1.4rem}
+    </style>""", unsafe_allow_html=True)
 
-# The feature set and XGBoost settings deliberately match the supplied script.
-FEATURES = [
-    "Open", "High", "Low", "Close", "Close_lag1", "Close_lag2", "Close_lag3",
-    "Open_lag1", "High_lag1", "Low_lag1", "Volume", "MA5", "MA10",
-]
-TARGETS = ["Open", "High", "Low", "Close"]
-ALGORITHMS = ["XGBoost", "CatBoost", "AdaBoost", "Gradient Boosting", "Random Forest", "Extra Trees"]
-INTERVALS = {
-    "1 day (next trading day)": ("1d", "5y"),
-    "1 hour (next hour)": ("1h", "730d"),
-    "30 minutes (next bar)": ("30m", "60d"),
-    "15 minutes (next bar)": ("15m", "60d"),
-    "5 minutes (next bar)": ("5m", "60d"),
-}
-
-NSE_EQUITY_LIST_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
-
-
-@st.cache_data(ttl=86_400, show_spinner=False)
-def load_nse_equity_list() -> pd.DataFrame:
-    """Get the official NSE equity universe once daily instead of hard-coding stocks."""
-    listings = pd.read_csv(NSE_EQUITY_LIST_URL)
-    listings.columns = [str(column).strip() for column in listings.columns]
-    if not {"SYMBOL", "NAME OF COMPANY"}.issubset(listings.columns):
-        raise ValueError("The NSE equity-list file changed format.")
-    listings = listings.dropna(subset=["SYMBOL", "NAME OF COMPANY"]).drop_duplicates("SYMBOL")
-    listings["Yahoo ticker"] = listings["SYMBOL"].astype(str).str.strip() + ".NS"
-    listings["Label"] = listings["NAME OF COMPANY"].astype(str).str.strip() + " — " + listings["SYMBOL"].astype(str).str.strip()
-    return listings.sort_values("Label")[["Yahoo ticker", "Label"]]
-
-
-def create_model(algorithm: str):
-    """Build one regressor. XGBoost exactly preserves the supplied settings."""
-    if algorithm == "XGBoost":
-        return XGBRegressor(
-            n_estimators=300, learning_rate=0.05, max_depth=5, subsample=0.8,
-            colsample_bytree=0.8, random_state=42, objective="reg:squarederror", n_jobs=-1,
-        )
-    if algorithm == "CatBoost":
-        from catboost import CatBoostRegressor
-        return CatBoostRegressor(iterations=300, learning_rate=0.05, depth=5, random_seed=42,
-                                 loss_function="RMSE", verbose=False, thread_count=-1)
-    if algorithm == "AdaBoost":
-        return AdaBoostRegressor(n_estimators=300, learning_rate=0.05, random_state=42)
-    if algorithm == "Gradient Boosting":
-        return GradientBoostingRegressor(n_estimators=300, learning_rate=0.05, max_depth=5, random_state=42)
-    if algorithm == "Random Forest":
-        return RandomForestRegressor(n_estimators=300, max_depth=12, min_samples_leaf=2, random_state=42, n_jobs=-1)
-    if algorithm == "Extra Trees":
-        return ExtraTreesRegressor(n_estimators=300, max_depth=12, min_samples_leaf=2, random_state=42, n_jobs=-1)
-    raise ValueError(f"Unknown algorithm: {algorithm}")
-
-
-def load_prices(ticker: str, interval: str, period: str) -> pd.DataFrame:
-    """Download fresh Yahoo Finance OHLCV data for every forecast run."""
-    frame = yf.download(ticker, interval=interval, period=period, auto_adjust=False,
-                        progress=False, multi_level_index=False)
-    if frame.empty:
-        raise ValueError("Yahoo Finance returned no data. Check the ticker and interval.")
-    frame = frame.rename_axis("Date").reset_index()
-    return frame[["Date", "Open", "High", "Low", "Close", "Volume"]].dropna()
-
-
-def prepare_features(raw: pd.DataFrame) -> pd.DataFrame:
-    df = raw.copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"]).sort_values("Date").set_index("Date")
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["Close_lag1"] = df["Close"].shift(1)
-    df["Close_lag2"] = df["Close"].shift(2)
-    df["Close_lag3"] = df["Close"].shift(3)
-    df["Open_lag1"] = df["Open"].shift(1)
-    df["High_lag1"] = df["High"].shift(1)
-    df["Low_lag1"] = df["Low"].shift(1)
-    df["MA5"] = df["Close"].rolling(5).mean()
-    df["MA10"] = df["Close"].rolling(10).mean()
-    return df[~df.index.duplicated(keep="last")]
-
-
-def forecast(feature_df: pd.DataFrame, algorithm: str) -> tuple[dict[str, float], pd.DataFrame]:
-    df = feature_df.dropna(subset=FEATURES).copy()
-    if len(df) < 30:
-        raise ValueError("At least 30 complete bars are needed for this forecast.")
-    last_row = df.iloc[[-1]]
-    for target in TARGETS:
-        df[f"Target_{target}"] = df[target].shift(-1)
-    train = df.dropna(subset=[f"Target_{t}" for t in TARGETS])
-    predictions = {}
-    for target in TARGETS:
-        model = create_model(algorithm)
-        model.fit(train[FEATURES], train[f"Target_{target}"])
-        predictions[target] = float(model.predict(last_row[FEATURES])[0])
-    # Make each forecast internally valid OHLC after four independent predictions.
-    predictions["High"] = max(predictions["High"], predictions["Open"], predictions["Close"])
-    predictions["Low"] = min(predictions["Low"], predictions["Open"], predictions["Close"])
-    return predictions, df
-
-
-def backtest_last_five(feature_df: pd.DataFrame, algorithm: str) -> pd.DataFrame:
-    """Walk-forward predictions: every row uses only earlier observations."""
-    df = feature_df.dropna(subset=FEATURES).copy()
-    rows = []
-    # Forecast the known next bar after each of the five latest eligible origins.
-    for origin in range(max(30, len(df) - 6), len(df) - 1):
-        subset = df.iloc[: origin + 1].copy()
-        for target in TARGETS:
-            subset[f"Target_{target}"] = subset[target].shift(-1)
-        train = subset.dropna(subset=[f"Target_{t}" for t in TARGETS])
-        predicted = {}
-        for target in TARGETS:
-            model = create_model(algorithm)
-            model.fit(train[FEATURES], train[f"Target_{target}"])
-            predicted[target] = float(model.predict(subset.iloc[[-1]][FEATURES])[0])
-        actual = df.iloc[origin + 1]
-        rows.append({"Date": actual.name, **{f"Predicted {t}": predicted[t] for t in TARGETS},
-                     **{f"Actual {t}": float(actual[t]) for t in TARGETS}})
-    results = pd.DataFrame(rows)
-    if not results.empty:
-        results["Close deviation %"] = (results["Predicted Close"] - results["Actual Close"]).abs() / results["Actual Close"] * 100
-    return results
-
-
-def compare_algorithms(feature_df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
-    """Apply the identical five-bar walk-forward test to every selectable model."""
-    summaries, validations = [], {}
-    for algorithm in ALGORITHMS:
-        try:
-            validation = backtest_last_five(feature_df, algorithm)
-            if validation.empty:
-                raise ValueError("Insufficient eligible history")
-            row = {"Algorithm": algorithm}
-            for target in TARGETS:
-                actual = validation[f"Actual {target}"].replace(0, np.nan)
-                row[f"{target} deviation %"] = (
-                    (validation[f"Predicted {target}"] - validation[f"Actual {target}"]).abs() / actual * 100
-                ).mean()
-            row["Average OHLC deviation %"] = np.mean([row[f"{target} deviation %"] for target in TARGETS])
-            validations[algorithm] = validation
-            summaries.append(row)
-        except Exception as exc:
-            summaries.append({"Algorithm": algorithm, "Status": f"Not run: {exc}"})
-    ranking = pd.DataFrame(summaries)
-    if "Close deviation %" in ranking:
-        ranking = ranking.sort_values("Close deviation %", na_position="last").reset_index(drop=True)
-    return ranking, validations
-
-
-def make_forecast_record(ticker: str, stock_name: str, algorithm_choice: str = "All algorithms (compare)") -> dict[str, object]:
-    """Produce the CSV-ready next-day forecast for a single NSE stock."""
-    raw = load_prices(ticker, "1d", "5y")
-    feature_df = prepare_features(raw)
-    if algorithm_choice == "All algorithms (compare)":
-        rankings, validations = compare_algorithms(feature_df)
-        usable = rankings.dropna(subset=["Close deviation %"])
-        if usable.empty:
-            raise ValueError("No algorithm completed the five-day comparison")
-        algorithm = str(usable.iloc[0]["Algorithm"])
-        validation = validations[algorithm]
-    else:
-        algorithm = algorithm_choice
-        validation = backtest_last_five(feature_df, algorithm)
-    predicted, model_df = forecast(feature_df, algorithm)
-    last = model_df.iloc[-1]
-    forecast_date = next_label(model_df.index[-1], "1d")
-    close_deviation = validation["Close deviation %"].mean() if not validation.empty else np.nan
-    ohlc_deviations = []
-    for target in TARGETS:
-        actual = validation[f"Actual {target}"].replace(0, np.nan)
-        ohlc_deviations.append(((validation[f"Predicted {target}"] - validation[f"Actual {target}"]).abs() / actual * 100).mean())
-    return {
-        "Forecast Date": forecast_date.strftime("%Y-%m-%d"),
-        "Stock Name": stock_name,
-        "NSE Symbol": ticker.removesuffix(".NS"),
-        "Forecast Open": predicted["Open"],
-        "Today Open": last["Open"],
-        "Forecast High": predicted["High"],
-        "Today High": last["High"],
-        "Forecast Low": predicted["Low"],
-        "Today Low": last["Low"],
-        "Forecast Close": predicted["Close"],
-        "Today Close": last["Close"],
-        "Last 5 Days Close Deviation %": close_deviation,
-        "Last 5 Days OHLC Average Deviation %": np.nanmean(ohlc_deviations),
-        "Algorithm Used": algorithm,
-        "Status": "Forecast created",
-    }
-
-
-def run_batch(listings: pd.DataFrame, progress_label: str) -> pd.DataFrame:
-    """Keep going after individual ticker failures so one CSV covers the entire request."""
-    rows: list[dict[str, object]] = []
-    progress = st.progress(0, text=f"Preparing {progress_label}…")
-    status = st.empty()
-    total = len(listings)
-    for position, (_, row) in enumerate(listings.iterrows(), start=1):
-        ticker, label = row["Yahoo ticker"], row["Label"]
-        status.caption(f"{progress_label}: {position:,} of {total:,} — {label}")
-        try:
-            rows.append(make_forecast_record(ticker, label))
-        except Exception as exc:
-            rows.append({
-                "Forecast Date": "", "Stock Name": label, "NSE Symbol": ticker.removesuffix(".NS"),
-                "Forecast Open": np.nan, "Today Open": np.nan, "Forecast High": np.nan, "Today High": np.nan,
-                "Forecast Low": np.nan, "Today Low": np.nan, "Forecast Close": np.nan, "Today Close": np.nan,
-                "Last 5 Days Close Deviation %": np.nan, "Last 5 Days OHLC Average Deviation %": np.nan,
-                "Algorithm Used": "", "Status": f"Not forecast: {exc}",
-            })
-        progress.progress(position / total, text=f"{progress_label}: {position:,} of {total:,}")
-    status.empty()
-    progress.empty()
-    return pd.DataFrame(rows)
-
-
-def next_label(last_date: pd.Timestamp, interval: str) -> pd.Timestamp:
-    if interval == "1d":
-        candidate = last_date + pd.offsets.BDay(1)
-        return pd.Timestamp(candidate)
-    minutes = {"1h": 60, "30m": 30, "15m": 15, "5m": 5}[interval]
-    return last_date + timedelta(minutes=minutes)
-
-
-st.title("Next-bar OHLC forecast")
-st.caption("Official NSE stock directory + fresh Yahoo Finance OHLC history + the supplied four-model XGBoost next-row method. Forecasts are estimates, not investment advice.")
-
-left, right = st.columns([2, 1])
-try:
-    listings = load_nse_equity_list()
-    ticker_labels = dict(zip(listings["Yahoo ticker"], listings["Label"]))
-except Exception as exc:
-    st.error(f"Could not load the official NSE stock directory: {exc}")
-    st.stop()
-
-with left:
-    selected_tickers = st.multiselect("Select up to 10 NSE stocks (type to search)", list(ticker_labels),
-                                      format_func=lambda symbol: ticker_labels[symbol], max_selections=10,
-                                      placeholder="Search by company or NSE symbol")
-    chart_ticker = st.selectbox("Stock to show in the detailed chart", selected_tickers,
-                                format_func=lambda symbol: ticker_labels[symbol], index=None,
-                                disabled=not selected_tickers,
-                                placeholder="Select stock above")
-with right:
-    display_interval = st.selectbox("Forecast interval", list(INTERVALS))
-    chart_price = st.selectbox("Chart price", ["All OHLC", "Open", "High", "Low", "Close"])
-    selected_algorithm = st.selectbox("Forecast algorithm", ["All algorithms (compare)"] + ALGORITHMS,
-                                      help="All algorithms runs a five-bar walk-forward test for every model and selects the best recent close result for the chart.")
-    run = st.button("Forecast selected chart stock", type="primary", use_container_width=True, disabled=chart_ticker is None)
-    selected_batch_run = st.button("Download selected stocks CSV (max 10)", use_container_width=True,
-                                   disabled=not selected_tickers,
-                                   help="Forecasts every selected stock and downloads the requested CSV structure.")
-
-if selected_batch_run:
-    selected_listings = listings[listings["Yahoo ticker"].isin(selected_tickers)]
-    selected_results = run_batch(selected_listings, "Selected-stock forecast")
-    successful = (selected_results["Status"] == "Forecast created").sum()
-    st.success(f"Selected-stock batch complete: {successful:,} forecasts created out of {len(selected_results):,} stocks.")
-    st.download_button(
-        "Download selected stocks forecast CSV",
-        data=selected_results.to_csv(index=False).encode("utf-8"),
-        file_name="selected_nse_next_day_ohlc_forecasts.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    st.dataframe(selected_results, use_container_width=True, hide_index=True)
-
-if run:
-    ticker = chart_ticker
-    interval, period = INTERVALS[display_interval]
+def now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def con():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c=sqlite3.connect(DB_PATH,check_same_thread=False); c.row_factory=sqlite3.Row; return c
+def digest(password,salt=None):
+    salt=salt or secrets.token_hex(16)
+    return salt+"$"+hashlib.pbkdf2_hmac("sha256",password.encode(),salt.encode(),310000).hex()
+def valid(password,stored):
     try:
-        with st.spinner("Downloading latest history and training the selected forecast model(s)..."):
-            raw = load_prices(ticker, interval, period)
-            feature_df = prepare_features(raw)
-            if selected_algorithm == "All algorithms (compare)":
-                rankings, validations = compare_algorithms(feature_df)
-                usable = rankings.dropna(subset=["Close deviation %"])
-                if usable.empty:
-                    raise ValueError("None of the algorithms could complete the five-bar comparison.")
-                active_algorithm = usable.iloc[0]["Algorithm"]
-                validation = validations[active_algorithm]
+        salt,_=stored.split("$",1); return hmac.compare_digest(digest(password,salt),stored)
+    except ValueError: return False
+
+def setup_db():
+    with con() as c:
+        c.executescript("""CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,name TEXT UNIQUE COLLATE NOCASE,email TEXT UNIQUE COLLATE NOCASE,password TEXT,role TEXT,status TEXT,created TEXT,approved TEXT);
+        CREATE TABLE IF NOT EXISTS reset_requests(id INTEGER PRIMARY KEY,email TEXT,requested TEXT,done TEXT);""")
+        email=os.getenv("ADMIN_EMAIL","").strip().lower(); pwd=os.getenv("ADMIN_PASSWORD","")
+        if email and pwd and not c.execute("SELECT 1 FROM accounts WHERE email=?",(email,)).fetchone():
+            c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",(os.getenv("ADMIN_NAME","Administrator"),email,digest(pwd),"admin","active",now(),now()))
+
+def signup(name,email,password):
+    with con() as c:
+        first=c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]==0
+        try:
+            c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",(name.strip(),email.strip().lower(),digest(password),"admin" if first else "user","active" if first else "pending",now(),now() if first else None))
+            return True, "Your new account has been created. Please sign in." if first else "Your new account has been created and is awaiting administrator approval."
+        except sqlite3.IntegrityError: return False,"That name or email address is already registered."
+
+def login(identifier,password):
+    with con() as c: r=c.execute("SELECT * FROM accounts WHERE lower(email)=lower(?) OR lower(name)=lower(?)",(identifier,identifier)).fetchone()
+    if not r or not valid(password,r["password"]): return None,"Invalid username or password."
+    if r["status"]=="pending": return None,"Your account is waiting for administrator approval."
+    if r["status"]!="active": return None,"This account is not active."
+    return dict(r),None
+
+@st.cache_data(ttl=86400,show_spinner=False)
+def nse_stocks():
+    d=pd.read_csv(NSE_LIST); d.columns=[str(x).strip() for x in d.columns]
+    d=d.dropna(subset=["SYMBOL","NAME OF COMPANY"]).drop_duplicates("SYMBOL")
+    d["ticker"]=d.SYMBOL.astype(str).str.strip()+".NS"; d["label"]=d["NAME OF COMPANY"].astype(str).str.strip()+" — "+d.SYMBOL.astype(str).str.strip()
+    return d.sort_values("label")[["ticker","label"]]
+
+def prices(ticker,interval,period):
+    d=yf.download(ticker,interval=interval,period=period,auto_adjust=False,progress=False,multi_level_index=False)
+    if d.empty: raise ValueError("Yahoo Finance returned no data.")
+    return d.rename_axis("Date").reset_index()[["Date","Open","High","Low","Close","Volume"]].dropna()
+
+def features(raw):
+    d=raw.copy(); d.Date=pd.to_datetime(d.Date,errors="coerce"); d=d.dropna(subset=["Date"]).sort_values("Date").set_index("Date")
+    for col in ["Open","High","Low","Close","Volume"]: d[col]=pd.to_numeric(d[col],errors="coerce")
+    for col,n in [("Close_lag1",1),("Close_lag2",2),("Close_lag3",3)]: d[col]=d.Close.shift(n)
+    d["Open_lag1"]=d.Open.shift(1); d["High_lag1"]=d.High.shift(1); d["Low_lag1"]=d.Low.shift(1); d["MA5"]=d.Close.rolling(5).mean(); d["MA10"]=d.Close.rolling(10).mean()
+    return d[~d.index.duplicated(keep="last")]
+
+def model(name):
+    if name=="XGBoost": return XGBRegressor(n_estimators=300,learning_rate=.05,max_depth=5,subsample=.8,colsample_bytree=.8,random_state=42,objective="reg:squarederror",n_jobs=-1)
+    if name=="CatBoost":
+        from catboost import CatBoostRegressor
+        return CatBoostRegressor(iterations=300,learning_rate=.05,depth=5,random_seed=42,loss_function="RMSE",verbose=False,thread_count=-1)
+    if name=="AdaBoost": return AdaBoostRegressor(n_estimators=300,learning_rate=.05,random_state=42)
+    return GradientBoostingRegressor(n_estimators=300,learning_rate=.05,max_depth=5,random_state=42)
+
+def predict(d,name):
+    d=d.dropna(subset=FEATURES).copy()
+    if len(d)<30: raise ValueError("At least 30 complete bars are needed.")
+    for t in TARGETS: d["Target_"+t]=d[t].shift(-1)
+    train=d.dropna(subset=["Target_"+t for t in TARGETS]); last=d.iloc[[-1]]; out={}
+    for t in TARGETS:
+        m=model(name); m.fit(train[FEATURES],train["Target_"+t]); out[t]=float(m.predict(last[FEATURES])[0])
+    out["High"]=max(out["High"],out["Open"],out["Close"]); out["Low"]=min(out["Low"],out["Open"],out["Close"])
+    return out,d
+
+def validate(d,name):
+    d=d.dropna(subset=FEATURES).copy(); rows=[]
+    for i in range(max(30,len(d)-6),len(d)-1):
+        s=d.iloc[:i+1].copy()
+        for t in TARGETS:s["Target_"+t]=s[t].shift(-1)
+        train=s.dropna(subset=["Target_"+t for t in TARGETS]); p={}
+        for t in TARGETS:
+            m=model(name);m.fit(train[FEATURES],train["Target_"+t]);p[t]=float(m.predict(s.iloc[[-1]][FEATURES])[0])
+        a=d.iloc[i+1]; rows.append({"Date":a.name,**{"Forecast "+t:p[t] for t in TARGETS},**{"Actual "+t:float(a[t]) for t in TARGETS}})
+    r=pd.DataFrame(rows)
+    if not r.empty:r["Close deviation %"]=(r["Forecast Close"]-r["Actual Close"]).abs()/r["Actual Close"].replace(0,np.nan)*100
+    return r
+
+def forecast(ticker,interval,period,forced=None):
+    d=features(prices(ticker,interval,period)); results={}
+    candidates=[forced] if forced else ALGORITHMS
+    for name in candidates:
+        try:
+            v=validate(d,name)
+            if not v.empty: results[name]=v
+        except Exception: pass
+    if not results: raise ValueError("Not enough history to validate a forecast.")
+    best=forced or min(results,key=lambda x:results[x]["Close deviation %"].mean())
+    p,history=predict(d,best)
+    return p,history,results[best],best,{k:v["Close deviation %"].mean() for k,v in results.items()}
+
+def auth_screen():
+    st.markdown("<div class='hero'>MarketForecast</div><div class='sub'>Secure NSE OHLC forecasting</div>",unsafe_allow_html=True)
+    a,b,c=st.tabs(["Sign in","New sign up","Forgot password"])
+    with a:
+        with st.form("signin"):
+            user=st.text_input("Email or username"); password=st.text_input("Password",type="password"); submit=st.form_submit_button("Sign in",use_container_width=True)
+        if submit:
+            account,error=login(user,password)
+            if error:st.error(error)
+            else:st.session_state.account=account;st.rerun()
+    with b:
+        with st.form("register",clear_on_submit=True):
+            name=st.text_input("Name / username"); email=st.text_input("Email ID"); p1=st.text_input("Password",type="password");p2=st.text_input("Reconfirm password",type="password");submit=st.form_submit_button("Create account",use_container_width=True)
+        if submit:
+            if len(name.strip())<3 or "@" not in email or len(p1)<8:st.error("Provide a name, valid email, and a password of at least 8 characters.")
+            elif p1!=p2:st.error("Passwords do not match.")
             else:
-                active_algorithm = selected_algorithm
-                validation = backtest_last_five(feature_df, active_algorithm)
-                rankings = None
-            predicted, model_df = forecast(feature_df, active_algorithm)
-        last = model_df.iloc[-1]
-        forecast_date = next_label(model_df.index[-1], interval)
-        st.success(f"Updated from Yahoo Finance: {ticker}. Last completed bar: {model_df.index[-1]:%d %b %Y %H:%M}. Forecast model: {active_algorithm}.")
-        st.caption("Stock names: official NSE Equity List (refreshed daily). OHLCV: Yahoo Finance, downloaded now. The timestamp above is the newest bar returned by the provider; verify live trading values with NSE or your broker before acting.")
-        if rankings is not None:
-            st.subheader("Algorithm comparison — last five walk-forward forecasts")
-            st.caption("Lower deviation is better. The chart and next forecast use the algorithm with the lowest recent close deviation.")
-            numeric_columns = [column for column in rankings.columns if column.endswith("%")]
-            st.dataframe(rankings.style.format({column: "{:.2f}%" for column in numeric_columns}), use_container_width=True, hide_index=True)
-        cols = st.columns(4)
-        for col, key in zip(cols, TARGETS):
-            col.metric(f"Forecast {key}", f"{predicted[key]:,.2f}")
-        change = (predicted["Close"] - last["Close"]) / last["Close"] * 100
-        st.metric("Expected close change", f"{change:+.2f}%", f"Last close: {last['Close']:,.2f}")
+                ok,msg=signup(name,email,p1); (st.success if ok else st.error)(msg)
+    with c:
+        with st.form("forgot",clear_on_submit=True):
+            email=st.text_input("Registered email address");submit=st.form_submit_button("Request password reset",use_container_width=True)
+        if submit:
+            with con() as db: db.execute("INSERT INTO reset_requests(email,requested) VALUES(?,?)",(email.lower(),now()))
+            st.success("Your request has been sent to the administrator.")
 
-        chart_data = model_df.tail(5).copy()
-        fig = go.Figure()
-        selected_prices = TARGETS if chart_price == "All OHLC" else [chart_price]
-        palette = {"Open": "#1f77b4", "High": "#9467bd", "Low": "#d62728", "Close": "#16803a"}
-        for price in selected_prices:
-            fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data[price], mode="lines+markers",
-                                     name=f"Actual {price}", line=dict(color=palette[price], width=3)))
-        if not validation.empty:
-            for price in selected_prices:
-                fig.add_trace(go.Scatter(x=validation["Date"], y=validation[f"Predicted {price}"], mode="lines+markers",
-                                         name=f"Predicted {price}", line=dict(color="#f58220", dash="dot")))
-        # Starts at the latest actual value: orange forecast visibly joins the actual line.
-        for price in selected_prices:
-            fig.add_trace(go.Scatter(x=[model_df.index[-1], forecast_date], y=[last[price], predicted[price]], mode="lines+markers+text",
-                                     name=f"Next {price} forecast", text=["", f"{price} forecast"], textposition="top center",
-                                     line=dict(color="#f58220", width=3), marker=dict(color="#f58220", size=10)))
-        fig.update_layout(title="Last five bars: actual (colours) vs predicted (orange), plus connected next forecast", xaxis_title="Time", yaxis_title="Price", hovermode="x unified", height=520)
-        st.plotly_chart(fig, use_container_width=True)
-        st.subheader(f"Last five walk-forward validations — {active_algorithm}")
-        if validation.empty:
-            st.info("There is not enough eligible history to calculate five validations.")
+def user_screen(account):
+    st.title(f"Welcome, {account['name']}")
+    st.caption("The system automatically uses the model with the lowest recent validation deviation.")
+    try: stock=nse_stocks()
+    except Exception as e:st.error(f"Could not load NSE directory: {e}");return
+    labels=dict(zip(stock.ticker,stock.label)); one,two=st.columns([2,1])
+    with one: chosen=st.multiselect("Select up to 10 NSE stocks",list(labels),format_func=lambda x:labels[x],max_selections=10,placeholder="Search by company or symbol")
+    with two: choice=st.selectbox("Forecast interval",list(INTERVALS));go=st.button("Forecast selected stocks",type="primary",use_container_width=True,disabled=not chosen)
+    if not go:return
+    interval,period=INTERVALS[choice]; output=[]; checks=[]; bar=st.progress(0)
+    for i,t in enumerate(chosen,1):
+        try:
+            p,h,v,_,_=forecast(t,interval,period);last=h.iloc[-1]
+            output.append({"Stock":labels[t],"Forecast Open":p["Open"],"Forecast High":p["High"],"Forecast Low":p["Low"],"Forecast Close":p["Close"],"Expected Close Change %":(p["Close"]-last.Close)/last.Close*100,"Last 5 Days Deviation %":v["Close deviation %"].mean()})
+            v.insert(0,"Stock",labels[t]);checks.append(v)
+        except Exception as e:output.append({"Stock":labels[t],"Status":"Unavailable: "+str(e)})
+        bar.progress(i/len(chosen),text=f"Forecasting {i} of {len(chosen)}")
+    bar.empty();st.subheader("Forecast results");st.dataframe(pd.DataFrame(output).style.format({x:"{:.2f}" for x in ["Forecast Open","Forecast High","Forecast Low","Forecast Close","Expected Close Change %","Last 5 Days Deviation %"]}),use_container_width=True,hide_index=True)
+    if checks:
+        st.subheader("Last five days validation");st.dataframe(pd.concat(checks,ignore_index=True).style.format({x:"{:.2f}" for x in TARGETS+["Close deviation %"] if x in TARGETS+["Close deviation %"]}),use_container_width=True,hide_index=True)
+
+def admin_screen():
+    forecast_tab,accounts_tab=st.tabs(["Forecast workspace","Account approvals"])
+    with forecast_tab:
+        stock=nse_stocks();labels=dict(zip(stock.ticker,stock.label))
+        ticker=st.selectbox("NSE stock",list(labels),format_func=lambda x:labels[x]); interval_text=st.selectbox("Forecast interval",list(INTERVALS),key="admin_interval"); selected=st.selectbox("Forecast model",["Automatic best model"]+ALGORITHMS)
+        if st.button("Run administrator forecast",type="primary"):
+            with st.spinner("Running forecast…"):p,h,v,name,scores=forecast(ticker,*INTERVALS[interval_text],None if selected=="Automatic best model" else selected)
+            last=h.iloc[-1];st.success(f"Model used: {name}")
+            for col,key in zip(st.columns(4),TARGETS):col.metric("Forecast "+key,f"{p[key]:,.2f}")
+            st.metric("Expected close change",f"{(p['Close']-last.Close)/last.Close*100:+.2f}%")
+            if selected=="Automatic best model":st.dataframe(pd.DataFrame({"Algorithm":scores.keys(),"Close deviation %":scores.values()}).style.format({"Close deviation %":"{:.2f}%"}),hide_index=True)
+            fig=go.Figure();fig.add_trace(go.Scatter(x=h.tail(5).index,y=h.tail(5).Close,name="Actual close",mode="lines+markers",line={"color":"#16803a"}));fig.add_trace(go.Scatter(x=v.Date,y=v["Forecast Close"],name="Forecast close",mode="lines+markers",line={"color":"#f58220","dash":"dot"}));st.plotly_chart(fig,use_container_width=True)
+            st.subheader("Last five days validation");st.dataframe(v.style.format({x:"{:.2f}" for x in v.columns if x!="Date"}),hide_index=True,use_container_width=True)
+    with accounts_tab:
+        st.caption("Approve new accounts as users or administrators. Password reset requests appear below.")
+        with con() as db: pending=pd.read_sql_query("SELECT id,name,email,created FROM accounts WHERE status='pending' ORDER BY created",db); resets=pd.read_sql_query("SELECT email,requested FROM reset_requests WHERE done IS NULL ORDER BY requested",db)
+        if pending.empty:st.info("No accounts are waiting for approval.")
         else:
-            st.dataframe(validation.style.format({c: "{:.2f}" for c in validation.columns if c != "Date"}), use_container_width=True, hide_index=True)
-            st.caption(f"Mean absolute close deviation: {validation['Close deviation %'].mean():.2f}%  •  Maximum: {validation['Close deviation %'].max():.2f}%")
-    except Exception as exc:
-        st.error(str(exc))
-else:
-    st.info("Search for an NSE company or symbol, choose the interval and chart price, then select **Refresh data & forecast**.")
+            st.dataframe(pending[["name","email","created"]],hide_index=True,use_container_width=True); options={f"{r['name']} — {r['email']}":int(r.id) for _,r in pending.iterrows()}
+            with st.form("approve"):
+                target=st.selectbox("Pending account",list(options));role=st.radio("Approve as",["user","admin"],horizontal=True);approve=st.form_submit_button("Approve");reject=st.form_submit_button("Reject")
+            if approve or reject:
+                with con() as db:db.execute("UPDATE accounts SET status=?,role=?,approved=? WHERE id=?",("active" if approve else "rejected",role,now(),options[target]))
+                st.rerun()
+        st.subheader("Password reset requests");st.dataframe(resets if not resets.empty else pd.DataFrame({"Status":["No requests"]}),hide_index=True,use_container_width=True)
+        with st.form("reset"):
+            email=st.text_input("User email");password=st.text_input("New temporary password",type="password");submit=st.form_submit_button("Set new password")
+        if submit:
+            with con() as db:
+                changed=db.execute("UPDATE accounts SET password=? WHERE lower(email)=lower(?)",(digest(password),email)).rowcount
+                db.execute("UPDATE reset_requests SET done=? WHERE lower(email)=lower(?) AND done IS NULL",(now(),email.lower()))
+            (st.success if changed else st.error)("Password reset." if changed else "No account found.")
 
+def main():
+    style();setup_db()
+    if "account" not in st.session_state:auth_screen();return
+    account=st.session_state.account
+    if st.button("Sign out"):del st.session_state.account;st.rerun()
+    admin_screen() if account["role"]=="admin" else user_screen(account)
+if __name__=="__main__":main()
