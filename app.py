@@ -23,6 +23,7 @@ ALGORITHMS = ["XGBoost", "Gradient Boosting", "Histogram Gradient Boosting", "Ri
 INTERVALS = {"1 day (next trading day)":("1d","5y"),"1 hour (next hour)":("1h","730d"),"30 minutes (next bar)":("30m","60d"),"15 minutes (next bar)":("15m","60d"),"5 minutes (next bar)":("5m","60d")}
 DB_PATH = Path(os.getenv("APP_DB_PATH", Path(__file__).parent / "data" / "marketforecast.db"))
 NSE_LIST = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+ADMIN_EMAIL = "thirukarthik.rohit@gmail.com"
 
 def style():
     background = base64.b64encode((Path(__file__).parent / "assets" / "market-analytics.svg").read_bytes()).decode("ascii")
@@ -57,21 +58,31 @@ def setup_db():
         c.executescript("""CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,name TEXT UNIQUE COLLATE NOCASE,email TEXT UNIQUE COLLATE NOCASE,password TEXT,role TEXT,status TEXT,created TEXT,approved TEXT);
         CREATE TABLE IF NOT EXISTS reset_requests(id INTEGER PRIMARY KEY,email TEXT,requested TEXT,done TEXT);
         CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY,account_id INTEGER,username TEXT,event TEXT,stock TEXT,interval TEXT,occurred_at TEXT);""")
-        email=os.getenv("ADMIN_EMAIL","").strip().lower(); pwd=os.getenv("ADMIN_PASSWORD","")
-        if email and pwd and not c.execute("SELECT 1 FROM accounts WHERE email=?",(email,)).fetchone():
-            c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",(os.getenv("ADMIN_NAME","Administrator"),email,digest(pwd),"admin","active",now(),now()))
+        # Accounts incorrectly granted admin access by an older version must be approved again.
+        c.execute("UPDATE accounts SET role='user', status='pending' WHERE role='admin' AND lower(email) != ?",(ADMIN_EMAIL,))
+        pwd=os.getenv("ADMIN_PASSWORD","")
+        existing=c.execute("SELECT id,role FROM accounts WHERE lower(email)=?",(ADMIN_EMAIL,)).fetchone()
+        if pwd and not existing:
+            c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",(os.getenv("ADMIN_NAME","Project 24 Owner"),ADMIN_EMAIL,digest(pwd),"admin","active",now(),now()))
+        elif pwd and existing and existing['role']!='admin':
+            c.execute("UPDATE accounts SET password=?,role='admin',status='active',approved=? WHERE id=?",(digest(pwd),now(),existing['id']))
 
 def signup(name,email,password):
+    if email.strip().lower()==ADMIN_EMAIL:
+        return False,"The administrator account must be configured by the site owner. Please sign in after setup."
     with con() as c:
-        first=c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]==0
         try:
-            c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",(name.strip(),email.strip().lower(),digest(password),"admin" if first else "user","active" if first else "pending",now(),now() if first else None))
-            return True, "Your new account has been created. Please sign in." if first else "Your new account has been created and is awaiting administrator approval."
+            c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",(name.strip(),email.strip().lower(),digest(password),"user","pending",now(),None))
+            return True, "Your new account has been created and is awaiting administrator approval."
         except sqlite3.IntegrityError: return False,"That name or email address is already registered."
 
 def login(identifier,password):
     with con() as c: r=c.execute("SELECT * FROM accounts WHERE lower(email)=lower(?) OR lower(name)=lower(?)",(identifier,identifier)).fetchone()
-    if not r or not valid(password,r["password"]): return None,"Invalid username or password."
+    if not r: return None,"Invalid username or password."
+    if r['email'].lower()==ADMIN_EMAIL:
+        configured=os.getenv('ADMIN_PASSWORD','')
+        if not configured or not hmac.compare_digest(password,configured): return None,"Invalid username or password."
+    elif not valid(password,r["password"]): return None,"Invalid username or password."
     if r["status"]=="pending": return None,"Your account is waiting for administrator approval."
     if r["status"]!="active": return None,"This account is not active."
     return dict(r),None
@@ -224,15 +235,15 @@ def admin_screen():
             fig=go.Figure();fig.add_trace(go.Scatter(x=h.tail(5).index,y=h.tail(5).Close,name="Actual close",mode="lines+markers",line={"color":"#16803a"}));fig.add_trace(go.Scatter(x=v.Date,y=v["Forecast Close"],name="Forecast close",mode="lines+markers",line={"color":"#f58220","dash":"dot"}));st.plotly_chart(fig,use_container_width=True)
             st.subheader("Last five days validation");st.dataframe(v.style.format({x:"{:.2f}" for x in v.columns if x!="Date"}),hide_index=True,use_container_width=True)
     with accounts_tab:
-        st.caption("Approve new accounts as users or administrators. Password reset requests appear below.")
+        st.caption("Approve new accounts as users. Password reset requests appear below.")
         with con() as db: pending=pd.read_sql_query("SELECT id,name,email,created FROM accounts WHERE status='pending' ORDER BY created",db); resets=pd.read_sql_query("SELECT email,requested FROM reset_requests WHERE done IS NULL ORDER BY requested",db)
         if pending.empty:st.info("No accounts are waiting for approval.")
         else:
             st.dataframe(pending[["name","email","created"]],hide_index=True,use_container_width=True); options={f"{r['name']} — {r['email']}":int(r.id) for _,r in pending.iterrows()}
             with st.form("approve"):
-                target=st.selectbox("Pending account",list(options));role=st.radio("Approve as",["user","admin"],horizontal=True);approve=st.form_submit_button("Approve");reject=st.form_submit_button("Reject")
+                target=st.selectbox("Pending account",list(options));approve=st.form_submit_button("Approve as user");reject=st.form_submit_button("Reject")
             if approve or reject:
-                with con() as db:db.execute("UPDATE accounts SET status=?,role=?,approved=? WHERE id=?",("active" if approve else "rejected",role,now(),options[target]))
+                with con() as db:db.execute("UPDATE accounts SET status=?,role='user',approved=? WHERE id=?",("active" if approve else "rejected",now(),options[target]))
                 st.rerun()
         st.subheader("Password reset requests");st.dataframe(resets if not resets.empty else pd.DataFrame({"Status":["No requests"]}),hide_index=True,use_container_width=True)
         with st.form("reset"):
