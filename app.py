@@ -24,6 +24,8 @@ INTERVALS = {"1 day (next trading day)":("1d","5y"),"1 hour (next hour)":("1h","
 DB_PATH = Path(os.getenv("APP_DB_PATH", Path(__file__).parent / "data" / "marketforecast.db"))
 NSE_LIST = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 ADMIN_EMAIL = "thirukarthik.rohit@gmail.com"
+DEMO_EMAIL = "test@gmail.com"
+DEMO_PASSWORD = "test@123"
 
 def style():
     background = base64.b64encode((Path(__file__).parent / "assets" / "market-analytics.svg").read_bytes()).decode("ascii")
@@ -66,10 +68,15 @@ def setup_db():
             c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",(os.getenv("ADMIN_NAME","Project 24 Owner"),ADMIN_EMAIL,digest(pwd),"admin","active",now(),now()))
         elif pwd and existing and existing['role']!='admin':
             c.execute("UPDATE accounts SET password=?,role='admin',status='active',approved=? WHERE id=?",(digest(pwd),now(),existing['id']))
+        demo=c.execute("SELECT id FROM accounts WHERE lower(email)=?",(DEMO_EMAIL,)).fetchone()
+        if not demo:
+            c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",("Project 24 Demo User",DEMO_EMAIL,digest(DEMO_PASSWORD),"user","active",now(),now()))
+        else:
+            c.execute("UPDATE accounts SET role='user',status='active' WHERE id=?",(demo['id'],))
 
 def signup(name,email,password):
-    if email.strip().lower()==ADMIN_EMAIL:
-        return False,"The administrator account must be configured by the site owner. Please sign in after setup."
+    if email.strip().lower() in {ADMIN_EMAIL, DEMO_EMAIL}:
+        return False,"This email is reserved. Please sign in or use another email address."
     with con() as c:
         try:
             c.execute("INSERT INTO accounts(name,email,password,role,status,created,approved) VALUES(?,?,?,?,?,?,?)",(name.strip(),email.strip().lower(),digest(password),"user","pending",now(),None))
@@ -82,6 +89,8 @@ def login(identifier,password):
     if r['email'].lower()==ADMIN_EMAIL:
         configured=os.getenv('ADMIN_PASSWORD','')
         if not configured or not hmac.compare_digest(password,configured): return None,"Invalid username or password."
+    elif r['email'].lower()==DEMO_EMAIL:
+        if not hmac.compare_digest(password,DEMO_PASSWORD): return None,"Invalid username or password."
     elif not valid(password,r["password"]): return None,"Invalid username or password."
     if r["status"]=="pending": return None,"Your account is waiting for administrator approval."
     if r["status"]!="active": return None,"This account is not active."
